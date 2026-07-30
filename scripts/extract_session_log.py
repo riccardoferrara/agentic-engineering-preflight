@@ -22,6 +22,11 @@ the preceding assistant activity. Subagent / sidechain entries
 (``isSidechain == true``) and meta entries (``isMeta == true``) are kept out of
 the main flow.
 
+When the human denies a tool's permission prompt, the harness records a canned
+error tool_result; those are surfaced as "permission denied" decisions (the tool
+that was denied, plus any steering message the human typed). Approvals leave no
+distinct record -- an approved tool just runs -- so only denials are captured.
+
 Standard library only; works on Python 3.8+.
 
 Examples
@@ -43,9 +48,11 @@ An explicit transcript file::
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -60,6 +67,15 @@ PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 # regardless of the current working directory.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = PROJECT_ROOT / "session_log.md"
+
+# Pasted images are dumped here so an image-capable reader can describe them.
+IMAGE_DUMP_DIR = Path(tempfile.gettempdir()) / "claude_session_images"
+_IMAGE_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
 
 # Tool calls whose inputs touch files we want to collect for "Files changed".
 FILE_WRITING_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Create"}
@@ -100,6 +116,31 @@ _NOISE_TAG_LOOSE = re.compile(
 # rather than as prose. (The matching <bash-stdout>/<bash-stderr> output arrives
 # as a separate user message and is stripped as noise above.)
 _BASH_INPUT = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL | re.IGNORECASE)
+
+# When the human denies a permission prompt, the harness feeds the assistant a
+# canned tool_result (is_error) whose content opens with one of these preambles.
+# An approval leaves no distinct record — the tool just runs — so denials are the
+# only permission *decision* we can observe.
+# ponytail: denials only; there is no approval marker in the transcript to parse.
+_PERMISSION_DENIAL_PREFIXES = (
+    "The user doesn't want to proceed with this tool use.",
+    "Permission for this tool use was denied.",
+)
+# Optional steering message the human typed when denying, e.g.
+# "…the user said:\nWe need a new branch for this". Captured up to the trailing
+# "Note:" hint block (or end of string).
+_DENIAL_MESSAGE = re.compile(
+    r"the user said:\s*\n?(.*?)(?:\n\nNote:|\Z)", re.DOTALL | re.IGNORECASE
+)
+
+
+def parse_permission_denial(content: str) -> Optional[str]:
+    """If ``content`` is a permission-denial tool_result, return the human's
+    steering message (``""`` if they just denied). Return ``None`` otherwise."""
+    if not isinstance(content, str) or not content.startswith(_PERMISSION_DENIAL_PREFIXES):
+        return None
+    m = _DENIAL_MESSAGE.search(content)
+    return m.group(1).strip() if m else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -344,6 +385,21 @@ def _human_text(entry: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _image_sources(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Base64 image ``source`` dicts attached to a message, in order."""
+    out: List[Dict[str, Any]] = []
+    for block in _content_blocks(entry):
+        if isinstance(block, dict) and block.get("type") == "image":
+            src = block.get("source")
+            if (
+                isinstance(src, dict)
+                and src.get("type") == "base64"
+                and isinstance(src.get("data"), str)
+            ):
+                out.append(src)
+    return out
+
+
 def clean_user_text(text: str) -> str:
     """Strip harness-injected wrappers while keeping the human's prose."""
     if not text:
@@ -509,6 +565,31 @@ def option_qa_from_result(
     return out
 
 
+def permission_denials_from_result(
+    entry: Dict[str, Any], tool_uses: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """Build a record for each permission the human denied in this tool_result.
+
+    ``tool_uses`` maps a tool_use id to its rendered label ("Name — descriptor")
+    so we can name the tool that was denied. Returns [] when nothing was denied.
+    """
+    out: List[Dict[str, Any]] = []
+    for block in _content_blocks(entry):
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        message = parse_permission_denial(_result_block_text(block))
+        if message is None:
+            continue
+        tuid = block.get("tool_use_id")
+        out.append(
+            {
+                "tool": tool_uses.get(tuid, "tool") if isinstance(tuid, str) else "tool",
+                "message": message,
+            }
+        )
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Timestamp formatting
 # --------------------------------------------------------------------------- #
@@ -575,6 +656,7 @@ class Turn:
     def __init__(self, user_text: str, timestamp: Optional[str]):
         self.user_text = user_text
         self.timestamp = timestamp
+        self.images: List[Dict[str, Any]] = []  # base64 source dicts, in order
         # Set when the user's input was a `!`-prefixed shell command.
         self.shell_command: Optional[str] = None
         self.assistant_text_blocks: List[str] = []
@@ -583,6 +665,7 @@ class Turn:
         self.option_qas: List[
             Dict[str, Any]
         ] = []  # AskUserQuestion: Q + options + choice
+        self.permission_denials: List[Dict[str, Any]] = []  # denied tool + message
         self.subagents: List[Dict[str, Any]] = []  # folded subagent summaries
         self.subagent_count = 0
 
@@ -609,6 +692,7 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
     current: Optional[Turn] = None
     pending_subagents = 0  # sidechain entries seen since the last real user msg
     pending_questions: Dict[str, Any] = {}  # tool_use id -> AskUserQuestion questions
+    tool_uses: Dict[str, str] = {}  # tool_use id -> "Name — descriptor" label
 
     for entry in entries:
         etype = entry.get("type")
@@ -630,21 +714,26 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
             if _is_tool_result_entry(entry):
                 # Fold the result into the current turn, condensed.
                 if current is not None:
+                    denials = permission_denials_from_result(entry, tool_uses)
                     qas = option_qa_from_result(entry, pending_questions)
+                    if denials:
+                        current.permission_denials.extend(denials)
                     if qas:
                         current.option_qas.extend(qas)
-                    else:
+                    elif not denials:
                         note = result_note(entry)
                         if note:
                             current.add_result_note(note)
                 continue
             # A real human message: start a new turn.
             text = clean_user_text(_human_text(entry))
+            images = _image_sources(entry)
             # An entry that becomes empty after stripping harness noise is not a
-            # meaningful turn on its own; skip it.
-            if not text:
+            # meaningful turn on its own; skip it -- unless it carried images.
+            if not text and not images:
                 continue
             current = Turn(text, entry.get("timestamp"))
+            current.images = images
             cmds = [c.strip() for c in _BASH_INPUT.findall(text) if c.strip()]
             if cmds:
                 current.shell_command = "\n".join(cmds)
@@ -667,7 +756,12 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
                 elif btype == "tool_use":
                     name = block.get("name", "tool")
                     tool_input = block.get("input")
-                    current.add_tool(name, tool_descriptor(name, tool_input))
+                    descriptor = tool_descriptor(name, tool_input)
+                    current.add_tool(name, descriptor)
+                    if isinstance(block.get("id"), str):
+                        tool_uses[block["id"]] = (
+                            f"{name} — {descriptor}" if descriptor else name
+                        )
                     if name in INTERACTION_TOOLS and isinstance(block.get("id"), str):
                         qs = (
                             tool_input.get("questions")
@@ -751,6 +845,12 @@ def render_summary(turns: List[Turn], first_ts: Optional[str]) -> List[str]:
             if not qa["chosen_labels"] and qa["answer_text"]:
                 out.append(f"- [x] _(custom answer)_ {qa['answer_text']}")
             out.append("")
+        for d in turn.permission_denials:
+            out.append(f"_Denied permission:_ **{d['tool']}**")
+            if d["message"]:
+                for line in d["message"].splitlines():
+                    out.append(f"> {line}" if line.strip() else ">")
+            out.append("")
         prev_ts = turn.timestamp
     return out
 
@@ -760,6 +860,7 @@ def render(
     files_changed: List[str],
     project_label: str,
     first_ts: Optional[str],
+    models: Optional[List[str]] = None,
 ) -> str:
     out: List[str] = []
     out.append("# Session Conversation Log")
@@ -768,6 +869,8 @@ def render(
         f"A turn-by-turn log of the conversation for {_derive_context_line(turns)}."
     )
     out.append(f"Project: {project_label}. Date: {date_only(first_ts)}.")
+    if models:
+        out.append(f"Model: {', '.join(models)}.")
     out.append("")
     out.append("---")
 
@@ -839,6 +942,14 @@ def render(
                 q = qa["header"] or _truncate(qa["question"], 80)
                 out.append(f"  _user chose:_ {q} → {chosen}")
 
+        if turn.permission_denials:
+            out.append("")
+            for d in turn.permission_denials:
+                line = f"  _user denied permission:_ {d['tool']}"
+                if d["message"]:
+                    line += f" → “{_truncate(d['message'], 160)}”"
+                out.append(line)
+
         for s in turn.subagents:
             out.append("")
             label = s["agent_type"]
@@ -902,6 +1013,49 @@ def first_timestamp(entries: List[Dict[str, Any]]) -> Optional[str]:
         if isinstance(ts, str) and ts:
             return ts
     return None
+
+
+def session_models(entries: List[Dict[str, Any]]) -> List[str]:
+    """Distinct model ids used by assistant messages, in first-seen order.
+
+    A session can switch models mid-run (e.g. /model), so return all of them.
+    """
+    models: List[str] = []
+    for entry in entries:
+        model = _get_message(entry).get("model")
+        # Synthetic/no-model assistant turns report "<synthetic>"; skip those.
+        if isinstance(model, str) and model and model != "<synthetic>" and model not in models:
+            models.append(model)
+    return models
+
+
+def dump_images(
+    turns: List[Turn], session_id: str, dump_dir: Path = IMAGE_DUMP_DIR
+) -> List[Path]:
+    """Write each turn's pasted images to ``dump_dir`` and append a marker to the
+    turn text pointing at the file. Descriptions are filled in later by an
+    image-capable reader (see the extract command); the script only dumps.
+
+    Returns the paths written. The marker text is stable so a describe pass can
+    find it: ``[Image dumped to `<path>` — description pending]``.
+    """
+    written: List[Path] = []
+    for ti, turn in enumerate(turns, 1):
+        for n, src in enumerate(turn.images, 1):
+            try:
+                raw = base64.b64decode(src.get("data", ""), validate=False)
+            except (ValueError, TypeError):
+                continue
+            ext = _IMAGE_EXT.get(src.get("media_type", ""), "img")
+            path = dump_dir / f"{session_id}_turn{ti}_img{n}.{ext}"
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+            written.append(path)
+            turn.user_text = (
+                f"{turn.user_text}\n\n"
+                f"[Image dumped to `{path}` — description pending]"
+            ).strip()
+    return written
 
 
 # --------------------------------------------------------------------------- #
@@ -1075,6 +1229,7 @@ def render_transcript(transcript: Path, project_label_override: Optional[str]) -
     if not entries:
         raise ValueError(f"no parseable JSON entries found in {transcript}")
     turns, files_changed = build_turns(entries)
+    dump_images(turns, transcript.stem)
     subagents = load_subagents(transcript)
     attribute_subagents(turns, subagents)
     project_label = project_label_override or derive_project_label(transcript, entries)
@@ -1083,6 +1238,7 @@ def render_transcript(transcript: Path, project_label_override: Optional[str]) -
         files_changed=files_changed,
         project_label=project_label,
         first_ts=first_timestamp(entries),
+        models=session_models(entries),
     )
 
 

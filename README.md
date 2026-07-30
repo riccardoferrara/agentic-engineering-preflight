@@ -36,34 +36,48 @@ Tear down with `docker compose down` (add `-v` to also drop the database volume)
 
 ## Exporting session logs
 
-`scripts/` has two mechanical extractors that turn an AI coding session into a readable
+`scripts/` has three mechanical extractors that turn an AI coding session into a readable
 markdown log (no LLM, no network — stdlib only). Run them from the repo root:
 
 ```bash
 python3 scripts/extract_session_log.py          # Claude Code sessions (~/.claude/projects/)
 python3 scripts/extract_codex_session_log.py    # Codex CLI sessions (~/.codex/sessions/)
+python3 scripts/extract_copilot_session_log.py  # GitHub Copilot CLI (~/.copilot/session-store.db)
 ```
 
 By default each writes the most recent session for the current directory to
-`session_log.md` / `codex_session_log.md` in the repo root.
+`session_log.md` / `codex_session_log.md` / `copilot_session_log.md` in the repo root.
 
-Useful flags (both scripts):
+Useful flags (all three scripts):
 
-- `--all` — one file per session (`session_log_<id>.md` / `codex_session_log_<id>.md`).
+- `--all` — one file per session (`session_log_<id>.md`, etc.).
 - `--strict` — only sessions started in *this exact directory*; skips the parent-dir walk
   and the "newest session anywhere" fallback, so you never accidentally export an unrelated
   project's transcript.
 - `--output DIR` — write to `DIR` instead of the repo root (or `--output -` for stdout).
 - a session id (or unique prefix) — export just that one session.
 
+Source-specific flags: the Codex extractor takes `--sessions-root DIR` and the Copilot
+extractor takes `--db PATH` to point at a non-default session store.
+
+Pasted images can't be read mechanically, so the extractors dump each one to a temp file and
+leave a `[Image dumped to … — description pending]` marker in the log. The harness shortcuts
+below do a follow-up pass that replaces those markers with a short image description; running
+the scripts directly leaves the markers in place.
+
 ### From inside your AI harness
 
 Each tool ships a shortcut so you can export without leaving the session:
 
-- **Claude Code** — run the `/extract-session-log` slash command
-  (`.claude/commands/extract-session-log.md`). Defaults to `--all`; append any of the flags
-  above, e.g. `/extract-session-log --strict`.
+- **Claude Code** — run the `/extract-claude-session-logs` slash command
+  (`.claude/commands/extract-claude-session-logs.md`). Defaults to `--all`; append any of the
+  flags above, e.g. `/extract-claude-session-logs --strict`.
 - **Codex** — invoke the `extract-codex-session-logs` skill (as `$extract-codex-session-logs`
-  or from the skills UI; see `.agents/skills/extract-codex-session-logs/`). It runs the Codex
-  extractor with `--all`; extra args like `--strict` or `--output DIR` are passed through.
+  or from the skills UI; see `.agents/skills/extract-codex-session-logs/`).
+- **GitHub Copilot** — invoke the `extract-copilot-session-logs` skill (as
+  `$extract-copilot-session-logs` or from the skills UI; see
+  `.agents/skills/extract-copilot-session-logs/`).
+
+Each shortcut runs its extractor with `--all` and passes through extra args like `--strict`
+or `--output DIR`.
 

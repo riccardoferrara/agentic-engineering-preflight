@@ -6,12 +6,24 @@ Run: python3 scripts/test_extract_session_log.py
 
 from __future__ import annotations
 
+import base64
+import tempfile
 from pathlib import Path
 
 from extract_session_log import (
+    Turn,
     _candidate_project_dirs,
     _parse_chosen,
     clean_user_text,
+    dump_images,
+    parse_permission_denial,
+    permission_denials_from_result,
+)
+
+# 1x1 transparent PNG.
+_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9"
+    "awAAAABJRU5ErkJggg=="
 )
 
 OPTS = [
@@ -32,6 +44,50 @@ def test_multiselect_comma():
     res = '"Q"="section, manufacturer_part_no". continue.'
     val, chosen = _parse_chosen("Q", OPTS, res)
     assert [o["label"] for o in chosen] == ["section", "manufacturer_part_no"], chosen
+
+
+def test_permission_denial_bare():
+    c = (
+        "The user doesn't want to proceed with this tool use. The tool use was "
+        "rejected (eg. if it was a file edit, the new_string was NOT written to "
+        "the file). STOP what you are doing and wait for the user to tell you how "
+        "to proceed.\n\nNote: The user's next message may contain a correction."
+    )
+    assert parse_permission_denial(c) == ""
+
+
+def test_permission_denial_with_message():
+    c = (
+        "Permission for this tool use was denied. The tool use was rejected (eg. "
+        "if it was a file edit, the new_string was NOT written to the file). The "
+        "user said:\nWe need a new branch for this"
+    )
+    assert parse_permission_denial(c) == "We need a new branch for this"
+
+
+def test_permission_denial_ignores_normal_result():
+    assert parse_permission_denial("42 files changed") is None
+    assert parse_permission_denial("error: file not found") is None
+
+
+def test_permission_denials_from_result_names_tool():
+    entry = {
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "is_error": True,
+                    "content": (
+                        "Permission for this tool use was denied. The tool use "
+                        "was rejected. The user said:\nno"
+                    ),
+                }
+            ]
+        }
+    }
+    out = permission_denials_from_result(entry, {"toolu_1": "Bash — rm -rf build"})
+    assert out == [{"tool": "Bash — rm -rf build", "message": "no"}]
 
 
 def test_custom_answer_matches_no_option():
@@ -73,6 +129,26 @@ def test_strict_candidate_dirs_skip_parents():
     assert len(strict) == 1  # only the cwd itself
     assert len(loose) > 1  # cwd + parents
     assert strict[0] == loose[0]
+
+
+def test_dump_images_writes_file_and_marker():
+    turn = Turn("look at this", None)
+    turn.images = [{"type": "base64", "media_type": "image/png", "data": _PNG_B64}]
+    dump_dir = Path(tempfile.mkdtemp())
+    written = dump_images([turn], "sess123", dump_dir=dump_dir)
+    assert len(written) == 1
+    p = written[0]
+    assert p.exists() and p.name == "sess123_turn1_img1.png"
+    assert p.read_bytes() == base64.b64decode(_PNG_B64)
+    assert "description pending" in turn.user_text
+    assert str(p) in turn.user_text
+
+
+def test_dump_images_noop_without_images():
+    turn = Turn("no images here", None)
+    dump_dir = Path(tempfile.mkdtemp())
+    assert dump_images([turn], "s", dump_dir=dump_dir) == []
+    assert turn.user_text == "no images here"
 
 
 if __name__ == "__main__":

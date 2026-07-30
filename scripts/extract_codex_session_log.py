@@ -21,6 +21,11 @@ This script is mechanical: no LLM, no summarization, and no network access.
 It intentionally ignores base instructions, developer messages, reasoning
 payloads, token counts, and encrypted/internal fields.
 
+When the human denies a tool's permission prompt, the decision is surfaced as a
+"permission denied" note on the turn (the tool that was denied, plus any steering
+message the human typed). Approvals leave no distinct record -- an approved tool
+just runs -- so only denials are captured.
+
 Examples
 --------
 Most recent transcript for the current project, written to
@@ -36,9 +41,11 @@ Every transcript for the current project, one file per session::
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -46,6 +53,15 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 CODEX_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = PROJECT_ROOT / "codex_session_log.md"
+
+# Pasted images are dumped here so an image-capable reader can describe them.
+IMAGE_DUMP_DIR = Path(tempfile.gettempdir()) / "codex_session_images"
+_IMAGE_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
 
 TOOL_DESC_MAX = 120
 RESULT_NOTE_MAX = 160
@@ -68,6 +84,34 @@ _NOISE_TAG_LOOSE = re.compile(
     re.IGNORECASE,
 )
 _BASH_INPUT = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL | re.IGNORECASE)
+_DATA_IMAGE_URL = re.compile(r"^data:(image/[A-Za-z0-9.+-]+);base64,(.*)$", re.DOTALL)
+
+# When the human denies a tool's permission prompt, the decision is fed back as
+# the same canned rejection text the Claude harness emits; in Codex logs the
+# orchestrator wraps it as an "[external_agent_tool_result: error]" assistant
+# message. Approvals leave no distinct record -- the tool just runs -- so denials
+# are the only permission decision we can observe here.
+# ponytail: denials only; there is no approval marker in the transcript to parse.
+_PERMISSION_DENIAL_PREFIXES = (
+    "The user doesn't want to proceed with this tool use.",
+    "Permission for this tool use was denied.",
+)
+_EXT_AGENT_PREFIX = re.compile(r"^\[external_agent_tool_result[^\]]*\]\s*", re.IGNORECASE)
+_DENIAL_MESSAGE = re.compile(
+    r"the user said:\s*\n?(.*?)(?:\n\nNote:|\Z)", re.DOTALL | re.IGNORECASE
+)
+
+
+def parse_permission_denial(text: Any) -> Optional[str]:
+    """If ``text`` is a permission-denial message, return the human's steering
+    message (``""`` if they just denied). Return ``None`` otherwise."""
+    if not isinstance(text, str):
+        return None
+    stripped = _EXT_AGENT_PREFIX.sub("", text).lstrip()
+    if not stripped.startswith(_PERMISSION_DENIAL_PREFIXES):
+        return None
+    m = _DENIAL_MESSAGE.search(stripped)
+    return m.group(1).strip() if m else ""
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -359,6 +403,79 @@ def assistant_text_from_payload(payload: Dict[str, Any]) -> str:
     return _content_text(payload.get("content"), ("text", "output_text")).strip()
 
 
+def _image_ref_from_string(value: str) -> Optional[Dict[str, Any]]:
+    if value.startswith("data:image/"):
+        return {"type": "data_url", "data_url": value}
+    if value.startswith("/") or value.startswith("~"):
+        return {"type": "path", "path": value}
+    return None
+
+
+def image_refs_from_event(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Image refs from Codex ``event_msg:user_message`` payloads."""
+    refs: List[Dict[str, Any]] = []
+
+    local_images = payload.get("local_images")
+    if isinstance(local_images, list):
+        for item in local_images:
+            if isinstance(item, str):
+                ref = _image_ref_from_string(item)
+                if ref:
+                    refs.append(ref)
+
+    images = payload.get("images")
+    if isinstance(images, list):
+        for item in images:
+            if isinstance(item, str):
+                ref = _image_ref_from_string(item)
+                if ref:
+                    refs.append(ref)
+            elif isinstance(item, dict):
+                url = item.get("image_url") or item.get("url")
+                if isinstance(url, str):
+                    ref = _image_ref_from_string(url)
+                    if ref:
+                        refs.append(ref)
+                        continue
+
+                path = item.get("path") or item.get("file_path")
+                if isinstance(path, str):
+                    ref = _image_ref_from_string(path)
+                    if ref:
+                        refs.append(ref)
+                        continue
+
+                data = item.get("data")
+                if isinstance(data, str):
+                    refs.append(
+                        {
+                            "type": "base64",
+                            "data": data,
+                            "media_type": item.get("media_type") or item.get("mime_type"),
+                        }
+                    )
+
+    return refs
+
+
+def image_refs_from_user_message_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Base64 image refs from ``response_item`` user-message content."""
+    refs: List[Dict[str, Any]] = []
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return refs
+
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "input_image":
+            continue
+        image_url = block.get("image_url")
+        if isinstance(image_url, str):
+            ref = _image_ref_from_string(image_url)
+            if ref:
+                refs.append(ref)
+    return refs
+
+
 def _decode_arguments(arguments: Any) -> Any:
     if isinstance(arguments, str):
         try:
@@ -612,11 +729,13 @@ class Turn:
     def __init__(self, user_text: str, timestamp: Optional[str]):
         self.user_text = user_text
         self.timestamp = timestamp
+        self.images: List[Dict[str, Any]] = []
         self.shell_command: Optional[str] = None
         self.assistant_text_blocks: List[str] = []
         self.tool_bullets: List[str] = []
         self.result_notes: List[str] = []
         self.option_qas: List[Dict[str, Any]] = []
+        self.permission_denials: List[Dict[str, Any]] = []  # denied tool + message
 
     def add_assistant_text(self, text: str) -> None:
         if text and text.strip():
@@ -640,6 +759,8 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
     current: Optional[Turn] = None
     call_names: Dict[str, str] = {}
     pending_questions: Dict[str, List[Any]] = {}
+    pending_user_images: List[Dict[str, Any]] = []
+    last_tool = ""  # most recent tool call, to name a denied permission
 
     for entry in entries:
         etype = entry.get("type")
@@ -649,13 +770,17 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
         if etype == "event_msg":
             if ptype == "user_message":
                 text = user_text_from_event(payload)
-                if not text:
+                images = pending_user_images or image_refs_from_event(payload)
+                pending_user_images = []
+                if not text and not images:
                     continue
                 current = Turn(text, entry.get("timestamp"))
+                current.images = images
                 cmds = [c.strip() for c in _BASH_INPUT.findall(text) if c.strip()]
                 if cmds:
                     current.shell_command = "\n".join(cmds)
                 turns.append(current)
+                last_tool = ""
                 continue
 
             if ptype == "patch_apply_end":
@@ -677,11 +802,23 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
 
         if ptype == "message":
             role = payload.get("role")
+            if role == "user":
+                # Codex emits the actual user turn as event_msg:user_message.
+                # The sibling response_item carries durable input_image data.
+                pending_user_images = image_refs_from_user_message_payload(payload)
+                continue
             if role == "assistant":
                 if current is None:
                     current = Turn("", entry.get("timestamp"))
                     turns.append(current)
-                current.add_assistant_text(assistant_text_from_payload(payload))
+                text = assistant_text_from_payload(payload)
+                message = parse_permission_denial(text)
+                if message is not None:
+                    current.permission_denials.append(
+                        {"tool": last_tool or "(tool call)", "message": message}
+                    )
+                else:
+                    current.add_assistant_text(text)
             # Ignore developer/system/user context response_items. Real user turns
             # are represented by event_msg:user_message above.
             continue
@@ -691,6 +828,7 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
                 current = Turn("", entry.get("timestamp"))
                 turns.append(current)
             name = payload.get("name") if isinstance(payload.get("name"), str) else "tool"
+            last_tool = name
             call_id = payload.get("call_id")
             if isinstance(call_id, str):
                 call_names[call_id] = name
@@ -733,12 +871,95 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
     return turns, files_changed
 
 
+def _image_bytes_and_ext(ref: Dict[str, Any]) -> Optional[Tuple[bytes, str]]:
+    kind = ref.get("type")
+
+    if kind == "data_url":
+        data_url = ref.get("data_url")
+        if not isinstance(data_url, str):
+            return None
+        match = _DATA_IMAGE_URL.match(data_url)
+        if not match:
+            return None
+        media_type, data = match.groups()
+        try:
+            raw = base64.b64decode(data, validate=False)
+        except (ValueError, TypeError):
+            return None
+        return raw, _IMAGE_EXT.get(media_type, "img")
+
+    if kind == "base64":
+        data = ref.get("data")
+        if not isinstance(data, str):
+            return None
+        try:
+            raw = base64.b64decode(data, validate=False)
+        except (ValueError, TypeError):
+            return None
+        media_type = ref.get("media_type")
+        return raw, _IMAGE_EXT.get(media_type, "img") if isinstance(media_type, str) else "img"
+
+    if kind == "path":
+        path_value = ref.get("path")
+        if not isinstance(path_value, str):
+            return None
+        path = Path(path_value).expanduser()
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        ext = path.suffix.lstrip(".") or "img"
+        return raw, ext
+
+    return None
+
+
+def dump_images(
+    turns: List[Turn], session_id: str, dump_dir: Path = IMAGE_DUMP_DIR
+) -> List[Path]:
+    """Write each turn's pasted images to ``dump_dir`` and append a marker.
+
+    The marker text matches the Claude extractor so an image-capable describe
+    pass can replace it with ``[Image: ... Text: ...]``.
+    """
+    written: List[Path] = []
+    for ti, turn in enumerate(turns, 1):
+        for n, ref in enumerate(turn.images, 1):
+            decoded = _image_bytes_and_ext(ref)
+            if decoded is None:
+                continue
+            raw, ext = decoded
+            path = dump_dir / f"{session_id}_turn{ti}_img{n}.{ext}"
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+            written.append(path)
+            turn.user_text = (
+                f"{turn.user_text}\n\n"
+                f"[Image dumped to `{path}` — description pending]"
+            ).strip()
+    return written
+
+
 def first_timestamp(entries: List[Dict[str, Any]]) -> Optional[str]:
     for entry in entries:
         ts = entry.get("timestamp")
         if isinstance(ts, str) and ts:
             return ts
     return None
+
+
+def session_models(entries: List[Dict[str, Any]]) -> List[str]:
+    """Distinct model ids from turn_context payloads, in first-seen order.
+
+    Codex records the model on each ``turn_context`` entry; a session can
+    switch models mid-run, so return all of them.
+    """
+    models: List[str] = []
+    for entry in entries:
+        model = _payload(entry).get("model")
+        if isinstance(model, str) and model and model not in models:
+            models.append(model)
+    return models
 
 
 def derive_project_label(transcript: Path, entries: List[Dict[str, Any]]) -> str:
@@ -805,6 +1026,13 @@ def render_summary(turns: List[Turn], first_ts: Optional[str]) -> List[str]:
                 out.append(f"- [x] _(custom answer)_ {qa['answer_text']}")
             out.append("")
 
+        for d in turn.permission_denials:
+            out.append(f"_Denied permission:_ **{d['tool']}**")
+            if d["message"]:
+                for line in d["message"].splitlines():
+                    out.append(f"> {line}" if line.strip() else ">")
+            out.append("")
+
         prev_ts = turn.timestamp
     return out
 
@@ -814,6 +1042,7 @@ def render(
     files_changed: List[str],
     project_label: str,
     first_ts: Optional[str],
+    models: Optional[List[str]] = None,
 ) -> str:
     out: List[str] = []
     out.append("# Codex Session Conversation Log")
@@ -822,6 +1051,8 @@ def render(
         f"A turn-by-turn log of the conversation for {_derive_context_line(turns)}."
     )
     out.append(f"Project: {project_label}. Date: {date_only(first_ts)}.")
+    if models:
+        out.append(f"Model: {', '.join(models)}.")
     out.append("")
     out.append("---")
 
@@ -887,6 +1118,14 @@ def render(
                 )
                 q = qa["header"] or _truncate(qa["question"], 80)
                 out.append(f"  _user chose:_ {q} -> {chosen}")
+
+        if turn.permission_denials:
+            out.append("")
+            for d in turn.permission_denials:
+                line = f"  _user denied permission:_ {d['tool']}"
+                if d["message"]:
+                    line += f" -> \"{_truncate(d['message'], 160)}\""
+                out.append(line)
 
         out.append("")
         out.append("---")
@@ -971,11 +1210,13 @@ def render_transcript(transcript: Path) -> str:
     if not entries:
         raise ValueError(f"no parseable JSON entries found in {transcript}")
     turns, files_changed = build_turns(entries)
+    dump_images(turns, output_identifier(transcript))
     return render(
         turns=turns,
         files_changed=files_changed,
         project_label=derive_project_label(transcript, entries),
         first_ts=first_timestamp(entries),
+        models=session_models(entries),
     )
 
 

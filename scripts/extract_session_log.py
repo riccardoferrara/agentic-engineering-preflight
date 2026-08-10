@@ -27,6 +27,11 @@ error tool_result; those are surfaced as "permission denied" decisions (the tool
 that was denied, plus any steering message the human typed). Approvals leave no
 distinct record -- an approved tool just runs -- so only denials are captured.
 
+Plan mode is the exception: a plan is presented via the ``ExitPlanMode`` tool and
+the human's approve/reject decision comes back as that tool's result. Both the
+plan text and the decision (including a plan the human edited in the approval
+dialog, or the steering message they typed when rejecting) are surfaced.
+
 Standard library only; works on Python 3.8+.
 
 Examples
@@ -84,6 +89,11 @@ FILE_WRITING_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Create"}
 # tool_result carries the human's selection, so we surface it as a user
 # interaction rather than folding it into the generic result notes.
 INTERACTION_TOOLS = {"AskUserQuestion"}
+
+# Plan mode: the assistant presents a plan via ExitPlanMode and the human either
+# approves it (optionally after editing it in the approval dialog) or rejects it
+# with a steering message. Both the plan and the decision are surfaced.
+PLAN_TOOLS = {"ExitPlanMode", "exit_plan_mode"}
 
 # Keys that, across tool versions, hold a target file path.
 FILE_PATH_KEYS = ("file_path", "path", "notebook_path", "filePath")
@@ -143,6 +153,35 @@ def parse_permission_denial(content: str) -> Optional[str]:
         return None
     m = _DENIAL_MESSAGE.search(content)
     return m.group(1).strip() if m else ""
+
+
+# An approved plan comes back as a tool_result opening with this preamble. When
+# the human edited the plan in the approval dialog, the *edited* text follows an
+# "## Approved Plan (edited by user):" heading — that version is what the
+# assistant actually works from, so it supersedes the proposed one.
+_PLAN_APPROVAL_PREFIX = "User has approved your plan"
+_PLAN_EDITED = re.compile(
+    r"^##\s*Approved Plan \(edited by user\):\s*\n(.*)\Z", re.DOTALL | re.MULTILINE
+)
+
+
+def parse_plan_decision(content: str) -> Tuple[str, str, str]:
+    """Classify an ExitPlanMode tool_result.
+
+    Returns ``(decision, edited_plan, message)`` where decision is
+    ``"approved"`` / ``"rejected"`` / ``"unknown"``, ``edited_plan`` is the
+    human's edited plan text (``""`` if they approved as-is), and ``message`` is
+    any steering message they typed when rejecting.
+    """
+    if not isinstance(content, str):
+        return "unknown", "", ""
+    if content.startswith(_PLAN_APPROVAL_PREFIX):
+        m = _PLAN_EDITED.search(content)
+        return "approved", m.group(1).strip() if m else "", ""
+    denial = parse_permission_denial(content)
+    if denial is not None:
+        return "rejected", "", denial
+    return "unknown", "", ""
 
 
 # --------------------------------------------------------------------------- #
@@ -567,6 +606,36 @@ def option_qa_from_result(
     return out
 
 
+def apply_plan_decisions(
+    entry: Dict[str, Any], pending_plans: Dict[str, Dict[str, Any]]
+) -> bool:
+    """Record the human's approve/reject decision on any plan in this result.
+
+    ``pending_plans`` maps a tool_use id to the plan record already attached to
+    the turn, so filling it in here updates the rendered log. Returns True when
+    the entry was a plan decision (and so should not also be folded in as a
+    generic result note or permission denial).
+    """
+    handled = False
+    for block in _content_blocks(entry):
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tuid = block.get("tool_use_id")
+        record = pending_plans.pop(tuid, None) if isinstance(tuid, str) else None
+        if record is None:
+            continue
+        decision, edited, message = parse_plan_decision(_result_block_text(block))
+        record["decision"] = decision
+        # The approval result always carries an "edited by user" copy of the
+        # plan, edited or not — only keep it when it actually differs.
+        record["edited_plan"] = (
+            edited if edited and edited.strip() != (record["plan"] or "").strip() else ""
+        )
+        record["message"] = message
+        handled = True
+    return handled
+
+
 def permission_denials_from_result(
     entry: Dict[str, Any], tool_uses: Dict[str, str]
 ) -> List[Dict[str, Any]]:
@@ -668,6 +737,7 @@ class Turn:
             Dict[str, Any]
         ] = []  # AskUserQuestion: Q + options + choice
         self.permission_denials: List[Dict[str, Any]] = []  # denied tool + message
+        self.plans: List[Dict[str, Any]] = []  # plan mode: plan text + decision
         self.subagents: List[Dict[str, Any]] = []  # folded subagent summaries
         self.subagent_count = 0
 
@@ -694,6 +764,7 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
     current: Optional[Turn] = None
     pending_subagents = 0  # sidechain entries seen since the last real user msg
     pending_questions: Dict[str, Any] = {}  # tool_use id -> AskUserQuestion questions
+    pending_plans: Dict[str, Dict[str, Any]] = {}  # tool_use id -> plan record
     tool_uses: Dict[str, str] = {}  # tool_use id -> "Name — descriptor" label
 
     for entry in entries:
@@ -716,6 +787,8 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
             if _is_tool_result_entry(entry):
                 # Fold the result into the current turn, condensed.
                 if current is not None:
+                    if apply_plan_decisions(entry, pending_plans):
+                        continue
                     denials = permission_denials_from_result(entry, tool_uses)
                     qas = option_qa_from_result(entry, pending_questions)
                     if denials:
@@ -758,6 +831,20 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
                 elif btype == "tool_use":
                     name = block.get("name", "tool")
                     tool_input = block.get("input")
+                    if name in PLAN_TOOLS:
+                        # Rendered as its own plan block, not a tool bullet.
+                        record = {
+                            "plan": (tool_input or {}).get("plan", "")
+                            if isinstance(tool_input, dict)
+                            else "",
+                            "decision": "no decision recorded",
+                            "edited_plan": "",
+                            "message": "",
+                        }
+                        current.plans.append(record)
+                        if isinstance(block.get("id"), str):
+                            pending_plans[block["id"]] = record
+                        continue
                     descriptor = tool_descriptor(name, tool_input)
                     current.add_tool(name, descriptor)
                     if isinstance(block.get("id"), str):
@@ -801,6 +888,11 @@ def _derive_context_line(turns: List[Turn]) -> str:
     return "a Claude Code working session"
 
 
+def _quote(text: str) -> List[str]:
+    """Blockquote a block of text so embedded markdown can't break the log."""
+    return [f"> {line}" if line.strip() else ">" for line in text.splitlines()]
+
+
 def render_summary(turns: List[Turn], first_ts: Optional[str]) -> List[str]:
     """The up-front recap: every turn that carried real user input.
 
@@ -810,7 +902,9 @@ def render_summary(turns: List[Turn], first_ts: Optional[str]) -> List[str]:
     one(s) checked.
     """
     out: List[str] = ["## Summary — user inputs", ""]
-    input_turns = [(i, t) for i, t in enumerate(turns, 1) if t.user_text.strip()]
+    input_turns = [
+        (i, t) for i, t in enumerate(turns, 1) if t.user_text.strip() or t.plans
+    ]
     if not input_turns:
         out += ["_(No user inputs in this transcript.)_", ""]
         return out
@@ -846,6 +940,17 @@ def render_summary(turns: List[Turn], first_ts: Optional[str]) -> List[str]:
                 out.append(row)
             if not qa["chosen_labels"] and qa["answer_text"]:
                 out.append(f"- [x] _(custom answer)_ {qa['answer_text']}")
+            out.append("")
+        for p in turn.plans:
+            out.append(
+                f"_Plan presented for approval — user **{p['decision']}**_"
+                + (" _(after editing it)_" if p["edited_plan"] else "")
+            )
+            out.append("> _(full plan text in Turn %d below)_" % i)
+            if p["message"]:
+                out.append("")
+                out.append("_Feedback the user gave:_")
+                out.extend(_quote(p["message"]))
             out.append("")
         for d in turn.permission_denials:
             out.append(f"_Denied permission:_ **{d['tool']}**")
@@ -915,7 +1020,7 @@ def render(
         body = "\n\n".join(c for c in assistant_chunks if c)
         if body:
             out.append(f"**Assistant:** {body}")
-        elif turn.tool_bullets:
+        elif turn.tool_bullets or turn.plans:
             out.append("**Assistant:**")
         else:
             out.append("**Assistant:** _(no response captured)_")
@@ -932,6 +1037,26 @@ def render(
                 notes += f"; (+{extra} more results)"
             out.append("")
             out.append(f"  _results:_ {_truncate(notes, 400)}")
+
+        for p in turn.plans:
+            out.append("")
+            out.append("**Assistant presented a plan for approval:**")
+            out.append("")
+            out.extend(_quote(p["plan"] or "_(empty plan)_"))
+            out.append("")
+            out.append(f"  _user {p['decision']} the plan_")
+            if p["message"]:
+                # Verbatim, not truncated: when a plan is sent back, what the
+                # human typed is the highest-signal input in the session.
+                out.append("")
+                out.append("  _feedback the user gave:_")
+                out.append("")
+                out.extend(_quote(p["message"]))
+            if p["edited_plan"]:
+                out.append("")
+                out.append("  _user edited the plan before approving; final version:_")
+                out.append("")
+                out.extend(_quote(p["edited_plan"]))
 
         if turn.option_qas:
             out.append("")

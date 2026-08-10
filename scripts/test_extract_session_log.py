@@ -14,10 +14,12 @@ from extract_session_log import (
     Turn,
     _candidate_project_dirs,
     _parse_chosen,
+    build_turns,
     clean_user_text,
     dump_images,
     parse_permission_denial,
     permission_denials_from_result,
+    render,
 )
 
 # 1x1 transparent PNG.
@@ -160,6 +162,100 @@ def test_dump_images_noop_without_images():
     dump_dir = Path(tempfile.mkdtemp())
     assert dump_images([turn], "s", dump_dir=dump_dir) == []
     assert turn.user_text == "no images here"
+
+
+def _plan_entries(result_text: str, plan: str = "# Plan\n\nStep one."):
+    return [
+        {
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"content": "build it"},
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_plan",
+                        "name": "ExitPlanMode",
+                        "input": {"plan": plan},
+                    }
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:02Z",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_plan",
+                        "content": result_text,
+                    }
+                ]
+            },
+        },
+    ]
+
+
+def test_plan_approved_is_captured():
+    turns, _ = build_turns(
+        _plan_entries(
+            "User has approved your plan. You can now start coding.\n\n"
+            "## Approved Plan (edited by user):\n# Plan\n\nStep one."
+        )
+    )
+    (plan,) = turns[0].plans
+    assert plan["plan"] == "# Plan\n\nStep one."
+    assert plan["decision"] == "approved"
+    # Unchanged plan echoed back under the "edited" heading is not an edit.
+    assert plan["edited_plan"] == ""
+    # The plan is rendered as its own block, not as a tool bullet.
+    assert turns[0].tool_bullets == []
+    assert turns[0].result_notes == []
+
+
+def test_plan_approved_with_edit_keeps_final_version():
+    turns, _ = build_turns(
+        _plan_entries(
+            "User has approved your plan.\n\n"
+            "## Approved Plan (edited by user):\n# Plan\n\nStep one, but smaller."
+        )
+    )
+    (plan,) = turns[0].plans
+    assert plan["decision"] == "approved"
+    assert plan["edited_plan"] == "# Plan\n\nStep one, but smaller."
+
+
+def test_plan_rejection_reason_is_captured_and_rendered():
+    # The wording the harness actually uses when a plan is sent back in plan mode.
+    turns, _ = build_turns(
+        _plan_entries(
+            "The user doesn't want to proceed with this tool use. The tool use "
+            "was rejected (eg. if it was a file edit, the new_string was NOT "
+            "written to the file). STOP what you are doing and wait for the user "
+            "to tell you how to proceed. The user provided the following reason "
+            "for the rejection:\nwrong table, use line_items\nand keep it in one "
+            "migration\n\nNote: The user's next message may contain a correction."
+        )
+    )
+    (plan,) = turns[0].plans
+    assert plan["decision"] == "rejected"
+    assert plan["message"] == "wrong table, use line_items\nand keep it in one migration"
+    # Routed to the plan record, not the generic permission-denial list.
+    assert turns[0].permission_denials == []
+    md = render(turns, [], "proj", None)
+    assert "> wrong table, use line_items" in md
+    assert "> and keep it in one migration" in md
+
+
+def test_plan_without_result_is_marked_undecided():
+    entries = _plan_entries("")[:2]
+    (plan,) = build_turns(entries)[0][0].plans
+    assert plan["decision"] == "no decision recorded"
 
 
 if __name__ == "__main__":

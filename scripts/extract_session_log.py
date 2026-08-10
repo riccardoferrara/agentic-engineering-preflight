@@ -127,10 +127,12 @@ _PERMISSION_DENIAL_PREFIXES = (
     "Permission for this tool use was denied.",
 )
 # Optional steering message the human typed when denying, e.g.
-# "…the user said:\nWe need a new branch for this". Captured up to the trailing
-# "Note:" hint block (or end of string).
+# "…the user said:\nWe need a new branch for this". A plan sent back in plan mode
+# uses a different lead-in ("…reason for the rejection: …") for the same thing.
+# Captured up to the trailing "Note:" hint block (or end of string).
 _DENIAL_MESSAGE = re.compile(
-    r"the user said:\s*\n?(.*?)(?:\n\nNote:|\Z)", re.DOTALL | re.IGNORECASE
+    r"(?:the user said|reason for the rejection):\s*\n?(.*?)(?:\n\nNote:|\Z)",
+    re.DOTALL | re.IGNORECASE,
 )
 
 

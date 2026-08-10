@@ -65,6 +65,17 @@ def test_permission_denial_with_message():
     assert parse_permission_denial(c) == "We need a new branch for this"
 
 
+def test_plan_rejection_reason_is_a_message():
+    # Plan mode words the same thing differently when a plan is sent back.
+    c = (
+        "The user doesn't want to proceed with this tool use. The tool use was "
+        "rejected. The user provided the following reason for the rejection:\n"
+        "wrong table, use line_items\n\nNote: The user's next message may contain "
+        "a correction."
+    )
+    assert parse_permission_denial(c) == "wrong table, use line_items"
+
+
 def test_permission_denial_ignores_normal_result():
     assert parse_permission_denial("42 files changed") is None
     assert parse_permission_denial("error: file not found") is None
